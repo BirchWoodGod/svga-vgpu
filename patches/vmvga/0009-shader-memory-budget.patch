@@ -1,0 +1,48 @@
+vmvga: give the total of all shaders its own budget
+
+vmvga used SVGA3D_MAX_SHADER_MEMORY_BYTES (8 MiB) both as the limit for
+one shader and as the limit for all defined shaders together. Games
+define thousands of shaders: Halo Online passes 8 MiB during a match,
+after which every SHADER_DEFINE is refused silently, the shader id stays
+undefined and every draw binding it is dropped (34 draws per frame on
+Guardian, among them the first-person weapon). Keep 8 MiB per shader;
+the total gets 128 MiB of host RAM. Rejections are now logged
+(VMVGA-SHADER-BUDGET, first 20).
+
+diff --git a/hw/display/vmware_vga_3d_state.c b/hw/display/vmware_vga_3d_state.c
+index 3faf740..35e5524 100644
+--- a/hw/display/vmware_vga_3d_state.c
++++ b/hw/display/vmware_vga_3d_state.c
+@@ -1483,6 +1483,9 @@ static VMSVGA3DQueryWaitStatus vmsvga3d_state_query_wait(
+     return VMSVGA3D_QUERY_WAIT_READY;
+ }
+ 
++/* Total bytecode of all defined shaders (host RAM). */
++#define VMSVGA3D_SHADER_BUDGET_BYTES (128u * 1024u * 1024u)
++
+ static bool vmsvga3d_state_shader_define(
+     struct vmsvga_state_s *s, uint32_t cid, uint32_t shid,
+     SVGA3dShaderType type, uint32_t bytecode_size, const uint32_t *bytecode)
+@@ -1513,8 +1516,20 @@ static bool vmsvga3d_state_shader_define(
+         new_shader_bytes -= old_shader->bytecode_size;
+     }
+ 
+-    if (new_shader_bytes > SVGA3D_MAX_SHADER_MEMORY_BYTES ||
+-        bytecode_size > SVGA3D_MAX_SHADER_MEMORY_BYTES - new_shader_bytes) {
++    /* SVGA3D_MAX_SHADER_MEMORY_BYTES (8 MiB) bounds one shader above; the
++     * total of all defined shaders gets its own, larger budget.  Games
++     * define thousands of shaders (Halo Online passes 8 MiB in a match),
++     * and a refused define leaves the shader id unbound, so every draw
++     * using it is dropped. */
++    if (new_shader_bytes > VMSVGA3D_SHADER_BUDGET_BYTES ||
++        bytecode_size > VMSVGA3D_SHADER_BUDGET_BYTES - new_shader_bytes) {
++        static unsigned logged;
++
++        if (logged++ < 20) {
++            fprintf(stderr, "VMVGA-SHADER-BUDGET reject shid=%u type=%u size=%u "
++                    "used=%zu limit=%u\n", shid, type, bytecode_size,
++                    new_shader_bytes, (unsigned)VMSVGA3D_SHADER_BUDGET_BYTES);
++        }
+         return false;
+     }
+ 

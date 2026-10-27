@@ -1,0 +1,55 @@
+vmvga: make the surface memory budget a device property
+
+vmvga caps the total surface memory (each surface has a CPU shadow) at a
+fixed 512 MiB. Halo Online passes it while loading; from then on every new
+surface is refused silently and every draw referencing one is dropped,
+including the final composite (a black main menu). Add a "surface_mb"
+property (default 512, clamped to 64..3072); SVGA_REG_MEMORY_SIZE follows
+it. Costs up to that much host RAM.
+
+diff --git a/hw/display/vmware_vga.c b/hw/display/vmware_vga.c
+index 40eb383..9b67db4 100644
+--- a/hw/display/vmware_vga.c
++++ b/hw/display/vmware_vga.c
+@@ -594,6 +594,7 @@ struct vmsvga_state_s {
+     bool debug;
+     bool enable_3d;
+     char *vgpu;
++    uint32_t surface_mb;   /* surface memory budget (MiB), property surface_mb */
+     enum vmsvga_vgpu_generation_e vgpu_generation;
+     /* Guest-visible renderer capabilities are latched during realization. */
+     bool svga3d_capable;
+@@ -3494,14 +3495,21 @@ static void vmsvga_objects_clear(struct vmsvga_state_s *s)
+ static inline size_t
+ vmsvga_surface_memory_size(const struct vmsvga_state_s *s)
+ {
+-    (void)s;
+-    return VMSVGA_SURFACE_MEMORY_SIZE;
++    /* Default 512 MiB.  Large D3D9 games (Halo Online: >5000 resources, with
++     * system-memory and default-pool copies) exhaust that, and every surface
++     * defined afterwards is refused silently, dropping all draws using it.
++     * Clamped to 64..3072 MiB so vram + budget fits the 32-bit
++     * SVGA_REG_MEMORY_SIZE. */
++    uint32_t mb = s->surface_mb ? s->surface_mb : VMSVGA_SURFACE_MEMORY_SIZE / (1024U * 1024U);
++
++    mb = MAX(64U, MIN(mb, 3072U));
++    return (size_t)mb * 1024U * 1024U;
+ }
+ 
+ static inline uint32_t
+ vmsvga_memory_size(const struct vmsvga_state_s *s)
+ {
+-    return s->vga.vram_size + VMSVGA_SURFACE_MEMORY_SIZE;
++    return s->vga.vram_size + (uint32_t)vmsvga_surface_memory_size(s);
+ }
+ 
+ static inline bool vmsvga_object_layout(uint32_t type, uint32_t width,
+@@ -11870,6 +11878,8 @@ static VMVGA_PROPERTY_QUALIFIER Property vga_vmware_properties[] = {
+       DEFINE_PROP_BOOL("3d", struct pci_vmsvga_state_s,
+                        chip.enable_3d, true),
+       DEFINE_PROP_STRING("vgpu", struct pci_vmsvga_state_s, chip.vgpu),
++      DEFINE_PROP_UINT32("surface_mb", struct pci_vmsvga_state_s,
++                         chip.surface_mb, 512),
+       VMVGA_PROPERTY_END
+ };
+ 

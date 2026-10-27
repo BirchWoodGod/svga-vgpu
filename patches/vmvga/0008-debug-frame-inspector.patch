@@ -1,0 +1,937 @@
+vmvga: env-gated frame inspector for debugging guest rendering
+
+Nothing changes unless the variables are set.
+
+  VMVGA_DUMP_DIR=<dir>     touch <dir>/trigger: the next present writes
+                           level 0 of every render target as raw files
+                           (sid<N>_fmt<F>_<W>x<H>_pitch<P>.raw), and the
+                           following frame is logged to <dir>/frame.txt
+                           (every draw: shaders, targets, textures, key
+                           states, result; clears, copies, blits).
+  VMVGA_DUMP_TEXTURES=1    also write CPU shadows of large textures.
+  VMVGA_DUMP_PS=<id,...>   in the logged frame, snapshot the first draw of
+                           each pixel shader: VS/PS bytecode, constants,
+                           texture and render states, vertex layout,
+                           vertex buffers, bound textures' shadows and
+                           the colour targets read back right after it
+                           (<dir>/draw_ps<id>/).
+  VMVGA_DUMP_ALL_RT=1      snapshots read back every render target.
+  VMVGA_LOG_VOLUME=1       log every volume-texture DMA/copy with the
+                           reason when the DMA is rejected.
+
+Failing draws are logged with their failure stage, and shader failures
+(undefined id, DXVK create/bind/constants) get their own frame-log line;
+shaders DXVK refuses are written as bad-vs<id>.bin / bad-ps<id>.bin.
+
+  VMVGA_FPS=1              every 5 s: presents/s and draws/s, FIFO and
+                           command-buffer traffic (SYNC writes, FIFO
+                           passes, fences, IRQs, stalls, CB submit/done/
+                           yield/IRQ).
+  VMVGA_PROFILE_DIR=<dir>  touch <dir>/profile: sample QEMU's main thread
+                           (instruction pointer + top-of-stack word) every
+                           0.5 ms of its CPU time for 10 s, then write
+                           samples.txt and maps.
+
+Host side: tools/framedump2png.py, tools/d3d9-disasm.py and
+tools/profile-report.py.
+
+diff --git a/hw/display/vmware_vga.c b/hw/display/vmware_vga.c
+index 9b67db4..cda7ce6 100644
+--- a/hw/display/vmware_vga.c
++++ b/hw/display/vmware_vga.c
+@@ -5977,6 +5977,7 @@ static void vmsvga_trace_gmr2_sample(struct vmsvga_state_s *s)
+ static void vmsvga_fifo_run(struct vmsvga_state_s *s, bool flush_damage,
+                             uint32_t dx_context)
+ {
++    vmsvga3d_debug_fps_counts.fifo_runs++;
+     VPRINT("vmsvga_fifo_run was just executed\n");
+     int32_t len;
+     uint32_t cmd;
+@@ -7065,6 +7066,7 @@ static void vmsvga_fifo_run(struct vmsvga_state_s *s, bool flush_damage,
+               len -= command_words + 1;
+               fence_arg = vmsvga_fifo_read(s);
+               s->fence = fence_arg;
++              vmsvga3d_debug_fps_counts.fences++;
+               if (vmsvga_fifo_has_reg(s, SVGA_FIFO_FENCE)) {
+                   s->fifo[SVGA_FIFO_FENCE] = cpu_to_le32(fence_arg);
+               }
+@@ -7627,6 +7629,7 @@ static void vmsvga_fifo_run(struct vmsvga_state_s *s, bool flush_damage,
+         }
+ 
+         if (s->fifo_stop == fifo_start && len == 0) {
++            vmsvga3d_debug_fps_counts.stalls++;
+             VMVGA_TRACE_LOCAL(
+                 VMVGA_TRACE_STATE,
+                 "FIFO_STALL cmd=%u stop=0x%08x next=0x%08x words=%d sync=%u",
+@@ -7665,6 +7668,7 @@ static void vmsvga_fifo_run(struct vmsvga_state_s *s, bool flush_damage,
+             if (irq_status & s->irq_mask) {
+                 struct pci_vmsvga_state_s *pci_vmsvga =
+                     container_of(s, struct pci_vmsvga_state_s, chip);
++                vmsvga3d_debug_fps_counts.irqs++;
+                 pci_set_irq(PCI_DEVICE(pci_vmsvga), 1);
+             }
+ #endif
+@@ -9907,6 +9911,8 @@ static void vmsvga_value_write(void *opaque, uint32_t address, uint32_t value)
+   case SVGA_REG_SYNC: {
+       bool sync_scheduled = false;
+ 
++      vmsvga3d_debug_fps_counts.sync++;
++
+       if (vmsvga_trace_flight_enabled()) {
+           uint32_t fifo_busy =
+               s->fifo != NULL && s->config &&
+diff --git a/hw/display/vmware_vga_3d.c b/hw/display/vmware_vga_3d.c
+index 9870f91..99e778c 100644
+--- a/hw/display/vmware_vga_3d.c
++++ b/hw/display/vmware_vga_3d.c
+@@ -609,6 +609,194 @@ static bool vmsvga3d_shader_type_index(SVGA3dShaderType type,
+     return true;
+ }
+ 
++/*
++ * Debug frame inspector state (see vmsvga3d_debug_dump_frame).  The draw
++ * snapshot flag is consumed by vmsvga3d_debug_dump_draw(); the frame log,
++ * when non-NULL, records every draw, clear and blit until the next present.
++ */
++static bool vmsvga3d_debug_draw_dump_armed;
++static GString *vmsvga3d_debug_frame_log;
++
++/*
++ * Sampling profiler for the thread that services presents (QEMU's main
++ * loop).  With VMVGA_PROFILE_DIR set, creating "$dir/profile" samples the
++ * instruction pointer every 0.5 ms of that thread's CPU time for 10 s, then
++ * writes $dir/samples.txt (one hex address per line) and $dir/maps (a copy
++ * of /proc/self/maps) for tools/profile-report.py.
++ */
++#include <signal.h>
++#include <time.h>
++#include <ucontext.h>
++#include <sys/syscall.h>
++
++#define VMSVGA3D_PROFILE_MAX_SAMPLES 200000u
++
++static uintptr_t *vmsvga3d_profile_samples;
++static uintptr_t *vmsvga3d_profile_callers;
++static volatile uint32_t vmsvga3d_profile_count;
++static timer_t vmsvga3d_profile_timer;
++static int64_t vmsvga3d_profile_end;
++
++static void vmsvga3d_profile_signal(int sig, siginfo_t *info, void *opaque)
++{
++    ucontext_t *uc = opaque;
++    uint32_t n = vmsvga3d_profile_count;
++
++    (void)sig;
++    (void)info;
++    if (vmsvga3d_profile_samples != NULL && n < VMSVGA3D_PROFILE_MAX_SAMPLES) {
++        vmsvga3d_profile_samples[n] = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
++        /* Top of stack: the return address when the sample hit a leaf
++         * routine such as memcpy. */
++        vmsvga3d_profile_callers[n] =
++            *(const uintptr_t *)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
++        vmsvga3d_profile_count = n + 1;
++    }
++}
++
++static void vmsvga3d_debug_profile_tick(void)
++{
++    static int enabled = -1;
++    static const char *dir;
++    int64_t now;
++
++    if (enabled < 0) {
++        dir = getenv("VMVGA_PROFILE_DIR");
++        enabled = dir != NULL && dir[0] != '\0';
++    }
++    if (!enabled) {
++        return;
++    }
++    now = g_get_monotonic_time();
++    if (vmsvga3d_profile_end == 0) {
++        g_autofree char *trigger = g_build_filename(dir, "profile", NULL);
++        struct sigaction sa = { 0 };
++        struct sigevent sev = { 0 };
++        struct itimerspec its = { 0 };
++        clockid_t clock;
++
++        if (!g_file_test(trigger, G_FILE_TEST_EXISTS)) {
++            return;
++        }
++        g_unlink(trigger);
++        if (vmsvga3d_profile_samples == NULL) {
++            vmsvga3d_profile_samples =
++                g_new0(uintptr_t, VMSVGA3D_PROFILE_MAX_SAMPLES);
++            vmsvga3d_profile_callers =
++                g_new0(uintptr_t, VMSVGA3D_PROFILE_MAX_SAMPLES);
++        }
++        vmsvga3d_profile_count = 0;
++        sa.sa_sigaction = vmsvga3d_profile_signal;
++        sa.sa_flags = SA_SIGINFO | SA_RESTART;
++        sigemptyset(&sa.sa_mask);
++        sigaction(SIGPROF, &sa, NULL);
++        if (pthread_getcpuclockid(pthread_self(), &clock) != 0) {
++            return;
++        }
++        sev.sigev_notify = SIGEV_THREAD_ID;
++        sev.sigev_signo = SIGPROF;
++        sev._sigev_un._tid = (pid_t)syscall(SYS_gettid);
++        if (timer_create(clock, &sev, &vmsvga3d_profile_timer) != 0) {
++            fprintf(stderr, "VMVGA-PROFILE timer_create failed\n");
++            return;
++        }
++        its.it_value.tv_nsec = 500000;
++        its.it_interval.tv_nsec = 500000;
++        timer_settime(vmsvga3d_profile_timer, 0, &its, NULL);
++        vmsvga3d_profile_end = now + 10 * G_USEC_PER_SEC;
++        fprintf(stderr, "VMVGA-PROFILE started\n");
++        return;
++    }
++    if (now >= vmsvga3d_profile_end) {
++        g_autofree char *path = g_build_filename(dir, "samples.txt", NULL);
++        g_autofree char *maps_path = g_build_filename(dir, "maps", NULL);
++        g_autofree char *maps = NULL;
++        g_autoptr(GString) out = g_string_new(NULL);
++        uint32_t i, count;
++
++        timer_delete(vmsvga3d_profile_timer);
++        count = vmsvga3d_profile_count;
++        for (i = 0; i < count; i++) {
++            g_string_append_printf(out, "%" PRIxPTR " %" PRIxPTR "\n",
++                                   vmsvga3d_profile_samples[i],
++                                   vmsvga3d_profile_callers[i]);
++        }
++        g_file_set_contents(path, out->str, out->len, NULL);
++        if (g_file_get_contents("/proc/self/maps", &maps, NULL, NULL)) {
++            g_file_set_contents(maps_path, maps, -1, NULL);
++        }
++        fprintf(stderr, "VMVGA-PROFILE wrote %u samples\n", count);
++        vmsvga3d_profile_end = 0;
++    }
++}
++
++/*
++ * VMVGA_FPS=1: every 5 s print presents (StretchBlt) and draws per second.
++ */
++static uint64_t vmsvga3d_debug_fps_draws;
++static struct {
++    uint64_t sync, fifo_runs, fences, irqs, stalls;
++    uint64_t cb_submit, cb_done, cb_yield, cb_irq, cb_bh;
++} vmsvga3d_debug_fps_counts;
++
++static void vmsvga3d_debug_fps_present(void)
++{
++    static int enabled = -1;
++    static int64_t window_start;
++    static uint64_t presents;
++    static uint64_t draws_at_start;
++    int64_t now;
++
++    if (enabled < 0) {
++        enabled = g_strcmp0(getenv("VMVGA_FPS"), "1") == 0;
++    }
++    if (!enabled) {
++        return;
++    }
++    now = g_get_monotonic_time();
++    if (window_start == 0) {
++        window_start = now;
++        draws_at_start = vmsvga3d_debug_fps_draws;
++    }
++    presents++;
++    if (now - window_start >= 5 * G_USEC_PER_SEC) {
++        double secs = (now - window_start) / (double)G_USEC_PER_SEC;
++
++        fprintf(stderr, "VMVGA-FPS presents/s=%.1f draws/s=%.0f sync/s=%.0f "
++                "fifo-runs/s=%.0f fences/s=%.0f irqs/s=%.0f stalls/s=%.0f\n",
++                presents / secs,
++                (vmsvga3d_debug_fps_draws - draws_at_start) / secs,
++                vmsvga3d_debug_fps_counts.sync / secs,
++                vmsvga3d_debug_fps_counts.fifo_runs / secs,
++                vmsvga3d_debug_fps_counts.fences / secs,
++                vmsvga3d_debug_fps_counts.irqs / secs,
++                vmsvga3d_debug_fps_counts.stalls / secs);
++        fprintf(stderr, "VMVGA-FPS cb-submit/s=%.0f cb-done/s=%.0f cb-yield/s=%.0f "
++                "cb-irq/s=%.0f cb-bh/s=%.0f\n",
++                vmsvga3d_debug_fps_counts.cb_submit / secs,
++                vmsvga3d_debug_fps_counts.cb_done / secs,
++                vmsvga3d_debug_fps_counts.cb_yield / secs,
++                vmsvga3d_debug_fps_counts.cb_irq / secs,
++                vmsvga3d_debug_fps_counts.cb_bh / secs);
++        memset(&vmsvga3d_debug_fps_counts, 0, sizeof(vmsvga3d_debug_fps_counts));
++        window_start = now;
++        presents = 0;
++        draws_at_start = vmsvga3d_debug_fps_draws;
++    }
++}
++
++static void G_GNUC_PRINTF(1, 2) vmsvga3d_debug_frame_logf(const char *fmt, ...)
++{
++    va_list ap;
++
++    if (vmsvga3d_debug_frame_log == NULL) {
++        return;
++    }
++    va_start(ap, fmt);
++    g_string_append_vprintf(vmsvga3d_debug_frame_log, fmt, ap);
++    va_end(ap);
++}
++
+ static void vmsvga3d_shader_free(VMSVGA3DShader *shader)
+ {
+     if (shader == NULL) {
+@@ -6500,6 +6688,20 @@ static bool vmsvga3d_handle_clear(struct vmsvga_state_s *s,
+     rects = (SVGA3dRect *)(body + 1);
+     rect_count = rect_bytes / sizeof(SVGA3dRect);
+     trace_3d = VMVGA_TRACE_LOCAL_ENABLED(VMVGA_TRACE_3D);
++    if (vmsvga3d_debug_frame_log != NULL) {
++        VMSVGA3DContext *log_context = vmsvga3d_context(s, body->cid);
++
++        if (log_context != NULL) {
++            vmsvga3d_debug_frame_logf(
++                "clear flags 0x%x color 0x%08x depth %g rects %u rt %d %d %d %d ds %d\n",
++                body->clearFlag, body->color, (double)body->depth, rect_count,
++                (int)log_context->render_targets[SVGA3D_RT_COLOR0].sid,
++                (int)log_context->render_targets[SVGA3D_RT_COLOR1].sid,
++                (int)log_context->render_targets[SVGA3D_RT_COLOR2].sid,
++                (int)log_context->render_targets[SVGA3D_RT_COLOR3].sid,
++                (int)log_context->render_targets[SVGA3D_RT_DEPTH].sid);
++        }
++    }
+     if (trace_3d && VMVGA_TRACE_DEEP_D3D9_STATE) {
+         VMSVGA3DContext *context = vmsvga3d_context(s, body->cid);
+         uint32_t color_sid = SVGA3D_INVALID_ID;
+@@ -6529,6 +6731,7 @@ static bool vmsvga3d_handle_clear(struct vmsvga_state_s *s,
+     }
+ 
+     accel = vmsvga3d_d3d9_try_clear(s, body, rects, rect_count);
++    vmsvga3d_debug_frame_logf("clear-result accel %u\n", (unsigned)accel);
+     if (accel == VMSVGA3D_D3D9_ACCEL_COMPLETE) {
+         wrote = true;
+     } else if (accel == VMSVGA3D_D3D9_ACCEL_UNAVAILABLE) {
+@@ -7415,6 +7618,23 @@ static bool vmsvga3d_handle_surface_copy(struct vmsvga_state_s *s,
+     body = payload;
+     boxes = (SVGA3dCopyBox *)(body + 1);
+     box_count = (size - sizeof(*body)) / sizeof(*boxes);
++    if (g_strcmp0(getenv("VMVGA_LOG_VOLUME"), "1") == 0 && s->svga3d != NULL) {
++        for (uint32_t vb = 0; vb < box_count; vb++) {
++            if (boxes[vb].d > 1 || boxes[vb].z != 0 || boxes[vb].srcz != 0) {
++                fprintf(stderr, "VMVGA-VOLUME copy %u:%u:%u -> %u:%u:%u "
++                        "box=%u,%u,%u/%ux%ux%u src=%u,%u,%u\n",
++                        body->src.sid, body->src.face, body->src.mipmap,
++                        body->dest.sid, body->dest.face, body->dest.mipmap,
++                        boxes[vb].x, boxes[vb].y, boxes[vb].z, boxes[vb].w,
++                        boxes[vb].h, boxes[vb].d, boxes[vb].srcx,
++                        boxes[vb].srcy, boxes[vb].srcz);
++            }
++        }
++    }
++    vmsvga3d_debug_frame_logf("copy %u:%u:%u -> %u:%u:%u boxes %u\n",
++                              body->src.sid, body->src.face, body->src.mipmap,
++                              body->dest.sid, body->dest.face, body->dest.mipmap,
++                              box_count);
+     state = s->svga3d;
+ 
+     if (state == NULL || body->src.sid >= SVGA3D_MAX_SURFACE_IDS ||
+@@ -7883,6 +8103,108 @@ static bool vmsvga3d_surface_stretchblt_point(
+     return true;
+ }
+ 
++/* Write level 0 of every render target (and optionally large textures) to dir. */
++static unsigned vmsvga3d_debug_dump_surfaces(struct vmsvga_state_s *s,
++                                             const char *dir, bool with_textures)
++{
++    uint32_t sid;
++    unsigned dumped = 0;
++    unsigned textures = 0;
++
++    for (sid = 0; sid < SVGA3D_MAX_SURFACE_IDS; sid++) {
++        VMSVGA3DSurface *surface = s->svga3d->surfaces[sid];
++        VMSVGA3DSurfaceImage *image;
++        g_autofree char *name = NULL;
++        g_autofree char *path = NULL;
++
++        bool is_target;
++        bool want_texture;
++
++        if (surface == NULL || surface->mip_count == 0 || surface->mips == NULL) {
++            continue;
++        }
++        is_target = (surface->surface_flags & (SVGA3D_SURFACE_HINT_RENDERTARGET |
++                                               SVGA3D_SURFACE_BIND_RENDER_TARGET)) != 0;
++        /* VMVGA_DUMP_TEXTURES=1: also large colour/compressed textures. */
++        want_texture = !is_target && with_textures &&
++                       textures < 120 &&
++                       (surface->format == SVGA3D_A8R8G8B8 || surface->format == SVGA3D_DXT1 ||
++                        surface->format == SVGA3D_DXT3 || surface->format == SVGA3D_DXT5 ||
++                        surface->format == SVGA3D_ATI2);
++        if (!is_target && !want_texture) {
++            continue;
++        }
++        if (want_texture && surface->mips[0].size.width >= 256) {
++            textures++;
++        }
++        image = &surface->mips[0];
++        if (image->size.width < (is_target ? 64u : 256u) || image->size.height < 64 ||
++            image->data == NULL || image->data_size == 0) {
++            continue;
++        }
++        bool shadow_only = false;
++
++        if (!vmsvga3d_surface_readback_to_shadow(s, surface, image, 0)) {
++            if (!want_texture) {
++                fprintf(stderr, "VMVGA-FRAMEDUMP sid=%u readback failed\n", sid);
++                continue;
++            }
++            /* Compressed textures can't be read back: dump the CPU shadow,
++             * i.e. exactly what vmvga uploads to the host GPU. */
++            shadow_only = true;
++        }
++        name = g_strdup_printf("sid%u_fmt%u_%ux%u_pitch%u%s.raw", sid,
++                               (unsigned)surface->format, image->size.width,
++                               image->size.height, image->pitch,
++                               shadow_only ? "_shadow" : "");
++        path = g_build_filename(dir, name, NULL);
++        if (g_file_set_contents(path, (const char *)image->data,
++                                (gssize)image->data_size, NULL)) {
++            dumped++;
++        }
++    }
++    return dumped;
++}
++
++/*
++ * Debug frame inspector.  With VMVGA_DUMP_DIR set, creating
++ * "$VMVGA_DUMP_DIR/trigger" makes the next present (StretchBlt) read every
++ * render-target surface back from the GPU and write its level 0 as raw data:
++ *   sid<sid>_fmt<svga-format>_<w>x<h>_pitch<pitch>.raw
++ * The trigger file is removed after the dump.
++ */
++static void vmsvga3d_debug_dump_frame(struct vmsvga_state_s *s)
++{
++    const char *dir = getenv("VMVGA_DUMP_DIR");
++    g_autofree char *trigger = NULL;
++    unsigned dumped;
++
++    if (dir == NULL || s->svga3d == NULL) {
++        return;
++    }
++    if (vmsvga3d_debug_frame_log != NULL) {
++        g_autofree char *log_path = g_build_filename(dir, "frame.txt", NULL);
++
++        g_file_set_contents(log_path, vmsvga3d_debug_frame_log->str,
++                            vmsvga3d_debug_frame_log->len, NULL);
++        fprintf(stderr, "VMVGA-FRAMEDUMP frame log written (%zu bytes)\n",
++                vmsvga3d_debug_frame_log->len);
++        g_string_free(vmsvga3d_debug_frame_log, true);
++        vmsvga3d_debug_frame_log = NULL;
++    }
++    trigger = g_build_filename(dir, "trigger", NULL);
++    if (!g_file_test(trigger, G_FILE_TEST_EXISTS)) {
++        return;
++    }
++    g_unlink(trigger);
++    vmsvga3d_debug_draw_dump_armed = true;
++
++    dumped = vmsvga3d_debug_dump_surfaces(
++        s, dir, g_strcmp0(getenv("VMVGA_DUMP_TEXTURES"), "1") == 0);
++    fprintf(stderr, "VMVGA-FRAMEDUMP wrote %u surfaces to %s\n", dumped, dir);
++    vmsvga3d_debug_frame_log = g_string_new(NULL);
++}
++
+ static bool vmsvga3d_handle_surface_stretchblt(struct vmsvga_state_s *s,
+                                                 uint32_t cmd, int32_t *len,
+                                                 uint32_t fifo_start)
+@@ -7914,6 +8236,12 @@ static bool vmsvga3d_handle_surface_stretchblt(struct vmsvga_state_s *s,
+         return true;
+     }
+ 
++    vmsvga3d_debug_fps_present();
++    vmsvga3d_debug_profile_tick();
++    vmsvga3d_debug_frame_logf("stretchblt %u -> %u\n",
++                              ((SVGA3dCmdSurfaceStretchBlt *)payload)->src.sid,
++                              ((SVGA3dCmdSurfaceStretchBlt *)payload)->dest.sid);
++    vmsvga3d_debug_dump_frame(s);
+     body = payload;
+     state = s->svga3d;
+     if (state == NULL || body->src.sid >= SVGA3D_MAX_SURFACE_IDS ||
+@@ -10244,6 +10572,7 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+     uint32_t subresource = 0;
+     uint32_t i;
+     bool valid = true;
++    const char *why = "ok";
+ 
+     (void)cmd;
+     if (!vmsvga3d_fifo_read_payload(s, len, fifo_start, &payload, &size)) {
+@@ -10286,12 +10615,18 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+ 
+     surface = valid ? state->surfaces[body->host.sid] : NULL;
+ 
+-    if (valid &&
+-        (!vmsvga3d_surface_image(surface, &body->host, &image) ||
+-         !vmsvga3d_d3d9_runtime_surface_info(s, surface, &surface_info) ||
+-         !vmsvga3d_d3d9_dma_plan(&surface_info, body->transfer, true,
+-                                 &transfer_plan))) {
++    if (valid && !vmsvga3d_surface_image(surface, &body->host, &image)) {
+         valid = false;
++        why = "surface-image";
++    }
++    if (valid && !vmsvga3d_d3d9_runtime_surface_info(s, surface, &surface_info)) {
++        valid = false;
++        why = "surface-info";
++    }
++    if (valid && !vmsvga3d_d3d9_dma_plan(&surface_info, body->transfer, true,
++                                         &transfer_plan)) {
++        valid = false;
++        why = "dma-plan";
+     }
+ 
+     if (valid) {
+@@ -10306,6 +10641,9 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+         valid = vmsvga3d_surface_dma_box(s, surface, image, &body->guest,
+                                          body->transfer, &boxes[i],
+                                          maximum_offset, false);
++        if (!valid) {
++            why = "box-check";
++        }
+     }
+ 
+     if (valid) {
+@@ -10313,6 +10651,7 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+             s, body, boxes, box_count, maximum_offset, &transfer_plan);
+         if (accel == VMSVGA3D_D3D9_ACCEL_FAILED) {
+             valid = false;
++            why = "d3d9-accel";
+         }
+     }
+ 
+@@ -10323,6 +10662,7 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+         !vmsvga3d_surface_readback_to_shadow(
+             s, surface, image, subresource)) {
+         valid = false;
++        why = "readback-to-shadow";
+     }
+ 
+     for (i = 0; valid && accel != VMSVGA3D_D3D9_ACCEL_COMPLETE &&
+@@ -10330,6 +10670,9 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+         valid = vmsvga3d_surface_dma_box(s, surface, image, &body->guest,
+                                          body->transfer, &boxes[i],
+                                          maximum_offset, true);
++        if (!valid) {
++            why = "box-copy";
++        }
+         if (valid && body->transfer == SVGA3D_WRITE_HOST_VRAM) {
+             valid = vmsvga3d_surface_dma_d3d11_upload_box(
+                 s, surface, image, subresource, &boxes[i]);
+@@ -10369,6 +10712,26 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+         }
+     }
+ 
++    /* Debug (VMVGA_LOG_VOLUME=1): volume-surface transfers. */
++    if (surface != NULL && surface->mip_count != 0 && surface->mips != NULL &&
++        surface->mips[0].size.depth > 1 &&
++        g_strcmp0(getenv("VMVGA_LOG_VOLUME"), "1") == 0) {
++        for (i = 0; i < box_count; i++) {
++            fprintf(stderr, "VMVGA-VOLUME dma sid=%u face=%u mip=%u transfer=%u "
++                    "box=%u,%u,%u/%ux%ux%u src=%u,%u,%u valid=%d why=%s "
++                    "accel=%d guest=%u+%u max=%u\n",
++                    body->host.sid, body->host.face, body->host.mipmap,
++                    body->transfer, boxes[i].x, boxes[i].y, boxes[i].z,
++                    boxes[i].w, boxes[i].h, boxes[i].d, boxes[i].srcx,
++                    boxes[i].srcy, boxes[i].srcz, valid, why, (int)accel,
++                    body->guest.ptr.gmrId, body->guest.ptr.offset, maximum_offset);
++        }
++        if (box_count == 0) {
++            fprintf(stderr, "VMVGA-VOLUME dma sid=%u no boxes valid=%d\n",
++                    body->host.sid, valid);
++        }
++    }
++
+     vmsvga3d_fifo_release_payload(s, payload);
+     return true;
+ }
+@@ -11316,6 +11679,7 @@ static bool vmsvga3d_command_buffer_execute_work(
+             work->shadow_yielded = true;
+         }
+         s->cb_yield_waiting = true;
++        vmsvga3d_debug_fps_counts.cb_yield++;
+         vmsvga3d_command_buffer_retry_arm(s);
+         VMVGA_TRACE_LOCAL(
+             VMVGA_TRACE_3D,
+@@ -11372,6 +11736,10 @@ static bool vmsvga3d_command_buffer_execute_work(
+         status == SVGA_CB_STATUS_COMMAND_ERROR ? processed : 0,
+         irq_flags, work->sequence, s->cb_queue_count);
+     vmsvga3d_command_buffer_raise_irq(s, irq_flags);
++    vmsvga3d_debug_fps_counts.cb_done++;
++    if (irq_flags & s->irq_mask) {
++        vmsvga3d_debug_fps_counts.cb_irq++;
++    }
+     s->cb_queue_executed++;
+     vmsvga3d_command_buffer_work_free(work);
+     return true;
+@@ -11389,6 +11757,7 @@ static void vmsvga3d_command_buffer_bh(void *opaque)
+ 
+     s->cb_bh_running = true;
+     s->cb_yield_waiting = false;
++    vmsvga3d_debug_fps_counts.cb_bh++;
+     while (buffers < VMSVGA_CB_BH_MAX_BUFFERS) {
+         struct vmsvga_command_buffer_work_s *work = s->cb_active_work;
+         uint32_t work_bytes;
+@@ -11581,6 +11950,7 @@ static void vmsvga3d_command_buffer_submit(struct vmsvga_state_s *s,
+     uint32_t irq_flags = 0;
+     bool reserved_nonzero = false;
+     unsigned i;
++    vmsvga3d_debug_fps_counts.cb_submit++;
+ 
+     if (s == NULL) {
+         return;
+diff --git a/hw/display/vmware_vga_vgpu9.c b/hw/display/vmware_vga_vgpu9.c
+index 18676c4..816dcac 100644
+--- a/hw/display/vmware_vga_vgpu9.c
++++ b/hw/display/vmware_vga_vgpu9.c
+@@ -3744,6 +3744,21 @@ static bool vmsvga3d_dxvk_apply_context_textures(
+     return true;
+ }
+ 
++static void vmsvga3d_debug_write_shader(const char *dir, const char *kind,
++                                        const VMSVGA3DShader *shader)
++{
++    g_autofree char *name = NULL;
++    g_autofree char *path = NULL;
++
++    if (shader == NULL || shader->bytecode == NULL) {
++        return;
++    }
++    name = g_strdup_printf("%s%u.bin", kind, shader->shid);
++    path = g_build_filename(dir, name, NULL);
++    g_file_set_contents(path, (const char *)shader->bytecode,
++                        shader->bytecode_size, NULL);
++}
++
+ static bool vmsvga3d_dxvk_apply_context_shaders(
+     struct vmsvga_state_s *s, VMSVGA3DContext *context, bool full_replay)
+ {
+@@ -3771,6 +3786,8 @@ static bool vmsvga3d_dxvk_apply_context_shaders(
+                 if (shid >= SVGA3D_MAX_SHADERIDS ||
+                     (shader = context->shader[type_index][shid]) == NULL ||
+                     shader->bytecode == NULL || shader->bytecode_size == 0) {
++                    vmsvga3d_debug_frame_logf("shader-fail type %u shid %u undefined\n",
++                                              type, shid);
+                     return false;
+                 }
+ 
+@@ -3779,6 +3796,16 @@ static bool vmsvga3d_dxvk_apply_context_shaders(
+                         vmsvga3d_dxvk_shader_create(s->dxvk, stage,
+                                                     shader->bytecode);
+                     if (shader->d3d9_native_shader == NULL) {
++                        vmsvga3d_debug_frame_logf(
++                            "shader-fail type %u shid %u create (%u bytes)\n",
++                            type, shid, shader->bytecode_size);
++                        if (vmsvga3d_debug_frame_log != NULL &&
++                            getenv("VMVGA_DUMP_DIR") != NULL) {
++                            vmsvga3d_debug_write_shader(
++                                getenv("VMVGA_DUMP_DIR"),
++                                type == SVGA3D_SHADERTYPE_VS ? "bad-vs" : "bad-ps",
++                                shader);
++                        }
+                         return false;
+                     }
+                 }
+@@ -3786,6 +3813,8 @@ static bool vmsvga3d_dxvk_apply_context_shaders(
+             }
+ 
+             if (!vmsvga3d_dxvk_shader_bind(s->dxvk, stage, native_shader)) {
++                vmsvga3d_debug_frame_logf("shader-fail type %u shid %u bind\n",
++                                          type, shid);
+                 return false;
+             }
+         }
+@@ -3856,6 +3885,9 @@ static bool vmsvga3d_dxvk_apply_context_shaders(
+ 
+                 if (!vmsvga3d_dxvk_shader_constants(
+                         s->dxvk, target, run_start, run_count, packed_values)) {
++                    vmsvga3d_debug_frame_logf(
++                        "shader-fail type %u shid %u constants ctype %u start %u count %u\n",
++                        type, shid, ctype, run_start, run_count);
+                     return false;
+                 }
+             }
+@@ -3874,6 +3906,226 @@ static bool vmsvga3d_dxvk_apply_context_shaders(
+     return true;
+ }
+ 
++/*
++ * Debug draw snapshot, armed by the frame dumper (VMVGA_DUMP_DIR trigger).
++ * The first successful draw whose pixel shader id equals VMVGA_DUMP_PS
++ * writes the bound VS/PS bytecode, every valid shader constant, the bound
++ * textures and the set render states to $VMVGA_DUMP_DIR/draw_ps<id>_*.
++ */
++static void vmsvga3d_debug_dump_draw(
++    struct vmsvga_state_s *s, VMSVGA3DContext *context, uint32_t cid,
++    const SVGA3dVertexDecl *decls, uint32_t decl_count,
++    const SVGA3dVertexDivisor *divisors, uint32_t divisor_count,
++    const VMSVGA3DD3D9VertexElement *elements,
++    const VMSVGA3DD3D9VertexStream *streams, uint32_t stream_count)
++{
++    const char *dir = vmsvga3d_debug_draw_dump_armed ? getenv("VMVGA_DUMP_DIR") : NULL;
++    const char *want = dir != NULL ? getenv("VMVGA_DUMP_PS") : NULL;
++    uint32_t vs = context->bound_shader[SVGA3D_SHADERTYPE_VS - SVGA3D_SHADERTYPE_MIN];
++    uint32_t ps = context->bound_shader[SVGA3D_SHADERTYPE_PS - SVGA3D_SHADERTYPE_MIN];
++    g_autoptr(GString) out = NULL;
++    g_autofree char *name = NULL;
++    g_autofree char *path = NULL;
++    uint32_t t, r, i;
++
++    static uint32_t done[16];
++    static uint32_t done_count;
++    g_auto(GStrv) wanted = NULL;
++    bool match = false;
++
++    if (!vmsvga3d_debug_draw_dump_armed || dir == NULL || want == NULL) {
++        return;
++    }
++    if (vmsvga3d_debug_frame_log == NULL) {
++        /* The frame after the trigger is over. */
++        vmsvga3d_debug_draw_dump_armed = false;
++        done_count = 0;
++        return;
++    }
++    /* VMVGA_DUMP_PS is a comma-separated list; dump the first draw of each. */
++    wanted = g_strsplit(want, ",", 16);
++    for (i = 0; wanted[i] != NULL; i++) {
++        if (strtoul(wanted[i], NULL, 10) == ps) {
++            match = true;
++        }
++    }
++    for (i = 0; i < done_count; i++) {
++        if (done[i] == ps) {
++            match = false;
++        }
++    }
++    if (!match || done_count == ARRAY_SIZE(done)) {
++        return;
++    }
++    done[done_count++] = ps;
++
++    out = g_string_new(NULL);
++    g_string_append_printf(out, "cid %u vs %u ps %u\n", cid, vs, ps);
++    for (r = SVGA3D_RT_DEPTH; r < SVGA3D_RT_MAX; r++) {
++        if (context->render_targets[r].sid != SVGA3D_INVALID_ID) {
++            g_string_append_printf(out, "rt %u sid %u face %u mip %u\n", r,
++                                   context->render_targets[r].sid,
++                                   context->render_targets[r].face,
++                                   context->render_targets[r].mipmap);
++        }
++    }
++    for (t = 0; t < SVGA3D_NUM_SHADERTYPE_PREDX; t++) {
++        const char *kind = t == SVGA3D_SHADERTYPE_VS - SVGA3D_SHADERTYPE_MIN ? "vs" : "ps";
++        uint32_t shid = context->bound_shader[t];
++
++        if (shid < SVGA3D_MAX_SHADERIDS) {
++            vmsvga3d_debug_write_shader(dir, kind, context->shader[t][shid]);
++        }
++        for (r = 0; r < SVGA3D_CONSTREG_MAX; r++) {
++            const VMSVGA3DShaderConstant *c = &context->shader_float[t][r];
++            float f[4];
++
++            if (!c->valid) {
++                continue;
++            }
++            memcpy(f, c->values, sizeof(f));
++            g_string_append_printf(out, "%s c%u = %g %g %g %g\n", kind, r,
++                                   f[0], f[1], f[2], f[3]);
++        }
++        for (r = 0; r < SVGA3D_CONSTINTREG_MAX; r++) {
++            const VMSVGA3DShaderConstant *c = &context->shader_int[t][r];
++
++            if (c->valid) {
++                g_string_append_printf(out, "%s i%u = %d %d %d %d\n", kind, r,
++                                       (int32_t)c->values[0], (int32_t)c->values[1],
++                                       (int32_t)c->values[2], (int32_t)c->values[3]);
++            }
++        }
++        for (r = 0; r < SVGA3D_CONSTBOOLREG_MAX; r++) {
++            const VMSVGA3DShaderConstant *c = &context->shader_bool[t][r];
++
++            if (c->valid) {
++                g_string_append_printf(out, "%s b%u = %u\n", kind, r, c->values[0]);
++            }
++        }
++    }
++    for (i = 0; i < VMSVGA3D_MAX_SAMPLERS; i++) {
++        for (t = SVGA3D_TS_MIN; t < SVGA3D_TS_MAX; t++) {
++            if (context->texture_state[i][t].valid) {
++                g_string_append_printf(out, "ts stage %u name %u = 0x%x\n", i, t,
++                                       context->texture_state[i][t].value);
++            }
++        }
++    }
++    /* Shadow copy (what the guest uploaded) of level 0 of each bound texture. */
++    for (i = 0; i < VMSVGA3D_MAX_SAMPLERS; i++) {
++        const VMSVGA3DStateValue *bind = &context->texture_state[i][SVGA3D_TS_BIND_TEXTURE];
++        VMSVGA3DSurface *tex;
++        g_autofree char *tname = NULL;
++        g_autofree char *tpath = NULL;
++
++        if (!bind->valid || bind->value >= SVGA3D_MAX_SURFACE_IDS ||
++            (tex = s->svga3d->surfaces[bind->value]) == NULL ||
++            tex->mip_count == 0 || tex->mips == NULL || tex->mips[0].data == NULL) {
++            continue;
++        }
++        g_string_append_printf(out, "tex stage %u sid %u fmt %u %ux%ux%u pitch %u "
++                               "mips %u flags 0x%llx data %u\n", i, bind->value,
++                               (unsigned)tex->format, tex->mips[0].size.width,
++                               tex->mips[0].size.height, tex->mips[0].size.depth,
++                               tex->mips[0].pitch, tex->mip_count,
++                               (unsigned long long)tex->surface_flags,
++                               tex->mips[0].data_size);
++        tname = g_strdup_printf("draw_ps%u_tex%u_sid%u_fmt%u_%ux%ux%u_pitch%u.shadow",
++                                ps, i, bind->value, (unsigned)tex->format,
++                                tex->mips[0].size.width, tex->mips[0].size.height,
++                                tex->mips[0].size.depth, tex->mips[0].pitch);
++        tpath = g_build_filename(dir, tname, NULL);
++        g_file_set_contents(tpath, (const char *)tex->mips[0].data,
++                            tex->mips[0].data_size, NULL);
++    }
++    for (r = SVGA3D_RS_MIN; r < SVGA3D_RS_MAX; r++) {
++        if (context->render_state[r].valid) {
++            g_string_append_printf(out, "rs %u = 0x%x\n", r,
++                                   context->render_state[r].value);
++        }
++    }
++    for (i = 0; i < decl_count; i++) {
++        g_string_append_printf(
++            out, "decl %u type %u method %u usage %u index %u sid %u offset %u "
++            "stride %u divisor 0x%x\n", i, decls[i].identity.type,
++            decls[i].identity.method, decls[i].identity.usage,
++            decls[i].identity.usageIndex, decls[i].array.surfaceId,
++            decls[i].array.offset, decls[i].array.stride,
++            i < divisor_count ? divisors[i].value : 0);
++    }
++    for (i = 0; i <= decl_count; i++) {
++        g_string_append_printf(out, "elem %u stream %u offset %u type %u method %u "
++                               "usage %u index %u\n", i, elements[i].stream,
++                               elements[i].offset, elements[i].type,
++                               elements[i].method, elements[i].usage,
++                               elements[i].usage_index);
++    }
++    for (i = 0; i < stream_count; i++) {
++        VMSVGA3DSurface *vb = streams[i].surface_id < SVGA3D_MAX_SURFACE_IDS
++                                  ? s->svga3d->surfaces[streams[i].surface_id]
++                                  : NULL;
++
++        g_string_append_printf(out, "stream %u sid %u offset %u stride %u freq 0x%x "
++                               "decls %u+%u\n", i, streams[i].surface_id,
++                               streams[i].source_offset, streams[i].stride,
++                               streams[i].frequency, streams[i].first_decl,
++                               streams[i].decl_count);
++        if (vb != NULL && vb->mip_count != 0 && vb->mips != NULL &&
++            vb->mips[0].data != NULL) {
++            g_autofree char *vname = g_strdup_printf("draw_ps%u_vb%u_sid%u.bin", ps,
++                                                     i, streams[i].surface_id);
++            g_autofree char *vpath = g_build_filename(dir, vname, NULL);
++
++            g_file_set_contents(vpath, (const char *)vb->mips[0].data,
++                                vb->mips[0].data_size, NULL);
++        }
++    }
++    name = g_strdup_printf("draw_ps%u.txt", ps);
++    path = g_build_filename(dir, name, NULL);
++    g_file_set_contents(path, out->str, out->len, NULL);
++    /* Read the colour targets back right after this draw, before later
++     * passes can overwrite them. */
++    {
++        g_autofree char *subname = g_strdup_printf("draw_ps%u", ps);
++        g_autofree char *sub = g_build_filename(dir, subname, NULL);
++
++        g_mkdir_with_parents(sub, 0755);
++        /* VMVGA_DUMP_ALL_RT=1: every render target, not just the bound ones. */
++        if (g_strcmp0(getenv("VMVGA_DUMP_ALL_RT"), "1") == 0) {
++            vmsvga3d_debug_dump_surfaces(s, sub, false);
++        }
++        for (r = SVGA3D_RT_COLOR0;
++             g_strcmp0(getenv("VMVGA_DUMP_ALL_RT"), "1") != 0 && r <= SVGA3D_RT_COLOR7;
++             r++) {
++            uint32_t sid = context->render_targets[r].sid;
++            VMSVGA3DSurface *rt;
++            VMSVGA3DSurfaceImage *image;
++            g_autofree char *rname = NULL;
++            g_autofree char *rpath = NULL;
++
++            if (sid >= SVGA3D_MAX_SURFACE_IDS ||
++                (rt = s->svga3d->surfaces[sid]) == NULL ||
++                rt->mip_count == 0 || rt->mips == NULL) {
++                continue;
++            }
++            image = &rt->mips[0];
++            if (image->data == NULL ||
++                !vmsvga3d_surface_readback_to_shadow(s, rt, image, 0)) {
++                fprintf(stderr, "VMVGA-FRAMEDUMP draw rt sid=%u readback failed\n", sid);
++                continue;
++            }
++            rname = g_strdup_printf("sid%u_fmt%u_%ux%u_pitch%u.raw", sid,
++                                    (unsigned)rt->format, image->size.width,
++                                    image->size.height, image->pitch);
++            rpath = g_build_filename(sub, rname, NULL);
++            g_file_set_contents(rpath, (const char *)image->data,
++                                (gssize)image->data_size, NULL);
++        }
++    }
++    fprintf(stderr, "VMVGA-FRAMEDUMP draw snapshot ps=%u written\n", ps);
++}
++
+ VMSVGA3DD3D9AccelResult vmsvga3d_d3d9_runtime_draw_primitives(
+     struct vmsvga_state_s *s, uint32_t cid, uint32_t vertex_decl_count,
+     const SVGA3dVertexDecl *vertex_decls, uint32_t range_count,
+@@ -4289,6 +4541,52 @@ out:
+         }
+     }
+ 
++    vmsvga3d_debug_fps_draws++;
++    if (vmsvga3d_debug_frame_log != NULL) {
++        static const uint32_t rs_ids[] = {
++            SVGA3D_RS_COLORWRITEENABLE, SVGA3D_RS_BLENDENABLE, SVGA3D_RS_SRCBLEND,
++            SVGA3D_RS_DSTBLEND, SVGA3D_RS_BLENDEQUATION, SVGA3D_RS_ZENABLE,
++            SVGA3D_RS_ZWRITEENABLE, SVGA3D_RS_ZFUNC, SVGA3D_RS_STENCILENABLE,
++            SVGA3D_RS_ALPHATESTENABLE, SVGA3D_RS_OUTPUTGAMMA,
++        };
++        static const char *const rs_names[] = {
++            "cwe", "blend", "src", "dst", "eq", "z", "zw", "zf", "st", "at", "gamma",
++        };
++        uint32_t k;
++
++        vmsvga3d_debug_frame_logf(
++            "draw %s%s vs %u ps %u rt %d %d %d %d ds %d streams %u tex",
++            success ? "ok" : "FAIL:",
++            success ? "" : (failure_stage != NULL ? failure_stage : "unknown"),
++            context->bound_shader[SVGA3D_SHADERTYPE_VS - SVGA3D_SHADERTYPE_MIN],
++            context->bound_shader[SVGA3D_SHADERTYPE_PS - SVGA3D_SHADERTYPE_MIN],
++            (int)context->render_targets[SVGA3D_RT_COLOR0].sid,
++            (int)context->render_targets[SVGA3D_RT_COLOR1].sid,
++            (int)context->render_targets[SVGA3D_RT_COLOR2].sid,
++            (int)context->render_targets[SVGA3D_RT_COLOR3].sid,
++            (int)context->render_targets[SVGA3D_RT_DEPTH].sid, stream_count);
++        for (k = 0; k < VMSVGA3D_MAX_SAMPLERS; k++) {
++            const VMSVGA3DStateValue *bind =
++                &context->texture_state[k][SVGA3D_TS_BIND_TEXTURE];
++
++            if (bind->valid && bind->value != SVGA3D_INVALID_ID) {
++                vmsvga3d_debug_frame_logf(" %u:%u", k, bind->value);
++            }
++        }
++        for (k = 0; k < ARRAY_SIZE(rs_ids); k++) {
++            const VMSVGA3DStateValue *rs = &context->render_state[rs_ids[k]];
++
++            if (rs->valid) {
++                vmsvga3d_debug_frame_logf(" %s=0x%x", rs_names[k], rs->value);
++            }
++        }
++        vmsvga3d_debug_frame_logf("\n");
++    }
++    if (success) {
++        vmsvga3d_debug_dump_draw(s, context, cid, vertex_decls, vertex_decl_count,
++                                 divisors, divisor_count, elements, streams,
++                                 stream_count);
++    }
+     if (trace && success) {
+         fprintf(stderr,
+                 "VMVGA-D3D9-DRAW result=OK cid=%u ranges=%u streams=%u "

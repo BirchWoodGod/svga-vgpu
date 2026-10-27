@@ -1,0 +1,52 @@
+vmvga: a DMA that overwrites the whole image needs no readback
+
+Before copying DMA boxes into a surface's CPU shadow, the fallback path
+reads the host copy back so data outside the boxes survives. Volume
+textures that are already resident on the host can't be read back, so
+their uploads failed with "readback-to-shadow" and the texture stayed
+empty. When a write's box covers the entire image nothing has to be
+preserved: skip the readback. In Halo Online this was the active
+16x16x16 colour-grading LUT, which turned every frame black after tone
+mapping.
+
+diff --git a/hw/display/vmware_vga_3d.c b/hw/display/vmware_vga_3d.c
+index 2335793..9870f91 100644
+--- a/hw/display/vmware_vga_3d.c
++++ b/hw/display/vmware_vga_3d.c
+@@ -10201,6 +10201,27 @@ static bool vmsvga3d_handle_intra_surface_copy(
+     return true;
+ }
+ 
++/*
++ * True when one of the boxes overwrites the whole image.  A write DMA like
++ * that does not need the host copy read back into the shadow first, which
++ * matters for resources the host can't read back (volume textures).
++ */
++static bool vmsvga3d_dma_boxes_cover_image(const VMSVGA3DSurfaceImage *image,
++                                           const SVGA3dCopyBox *boxes,
++                                           uint32_t box_count)
++{
++    uint32_t i;
++
++    for (i = 0; i < box_count; i++) {
++        if (boxes[i].x == 0 && boxes[i].y == 0 && boxes[i].z == 0 &&
++            boxes[i].w >= image->size.width && boxes[i].h >= image->size.height &&
++            boxes[i].d >= image->size.depth) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+                                         uint32_t cmd, int32_t *len,
+                                         uint32_t fifo_start)
+@@ -10297,6 +10318,8 @@ static bool vmsvga3d_handle_surface_dma(struct vmsvga_state_s *s,
+ 
+     if (valid && box_count != 0 &&
+         accel != VMSVGA3D_D3D9_ACCEL_COMPLETE &&
++        !(body->transfer == SVGA3D_WRITE_HOST_VRAM &&
++          vmsvga3d_dma_boxes_cover_image(image, boxes, box_count)) &&
+         !vmsvga3d_surface_readback_to_shadow(
+             s, surface, image, subresource)) {
+         valid = false;

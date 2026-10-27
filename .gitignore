@@ -1,0 +1,6 @@
+/build/
+guest/umd-shim/out*/
+*.qcow2
+*.iso
+*.img
+__pycache__/

@@ -1,0 +1,137 @@
+vmvga: fill shadow clears at memory speed
+
+An accelerated D3D9 clear also clears the CPU shadow of every target
+(the shadow must stay authoritative because eviction discards the host
+copy without a readback). That shadow clear stored every pixel through
+a byte-by-byte loop: in a Halo Online match, with about nine full-screen
+clears per frame on 4- and 8-byte-per-pixel targets, it was 52% of
+QEMU's main-thread time (plus most of the 27% in libc).
+
+Full-value fills now build one row by doubling memcpy()s from a single
+packed pixel and copy it to the other rows; depth/stencil clears that
+replace every bit of the pixel take the same path, and partial
+depth/stencil clears keep their read-modify-write with a 4-byte fast
+path. Bytes written are identical (randomized comparison against the
+old loops, 300,000 cases). Halo Online on Guardian: 31-32 -> 45-52
+presents per second.
+
+diff --git a/hw/display/vmware_vga_3d.c b/hw/display/vmware_vga_3d.c
+index 99e778c..a15f33f 100644
+--- a/hw/display/vmware_vga_3d.c
++++ b/hw/display/vmware_vga_3d.c
+@@ -6364,6 +6364,37 @@ static void vmsvga3d_store_le(uint8_t *data, uint32_t bytes,
+     }
+ }
+ 
++/*
++ * Fill a clipped rectangle of a shadow image with one packed pixel value.
++ * The first row is built by doubling copies of the first pixel and then
++ * copied to the other rows: the same bytes as a per-pixel store loop,
++ * at memory speed.
++ */
++static void vmsvga3d_fill_rect(VMSVGA3DSurfaceImage *image,
++                               const SVGA3dRect *rect, uint32_t bytes,
++                               uint32_t value)
++{
++    uint8_t *first = image->data + (uint64_t)rect->y * image->pitch +
++                     (uint64_t)rect->x * bytes;
++    size_t row_bytes = (size_t)rect->w * bytes;
++    size_t filled = bytes;
++    uint32_t y;
++
++    if (rect->w == 0 || rect->h == 0) {
++        return;
++    }
++    vmsvga3d_store_le(first, bytes, value);
++    while (filled < row_bytes) {
++        size_t chunk = MIN(filled, row_bytes - filled);
++
++        memcpy(first + filled, first, chunk);
++        filled += chunk;
++    }
++    for (y = 1; y < rect->h; y++) {
++        memcpy(first + (uint64_t)y * image->pitch, first, row_bytes);
++    }
++}
++
+ static bool vmsvga3d_clear_color_value(SVGA3dSurfaceFormat format,
+                                         uint32_t color, uint32_t *value,
+                                         uint32_t *bytes)
+@@ -6430,8 +6461,6 @@ static bool vmsvga3d_clear_color_image(VMSVGA3DSurface *surface,
+ 
+     for (i = 0; i < rect_count; i++) {
+         SVGA3dRect rect;
+-        uint32_t y;
+-        uint32_t x;
+ 
+         if (!vmsvga3d_clear_rect(&rects[i], &image->size, &rect)) {
+             continue;
+@@ -6441,13 +6470,7 @@ static bool vmsvga3d_clear_color_image(VMSVGA3DSurface *surface,
+             continue;
+         }
+ 
+-        for (y = 0; y < rect.h; y++) {
+-            uint8_t *row = image->data + (uint64_t)(rect.y + y) * image->pitch +
+-                           (uint64_t)rect.x * bytes;
+-            for (x = 0; x < rect.w; x++) {
+-                vmsvga3d_store_le(row + (uint64_t)x * bytes, bytes, value);
+-            }
+-        }
++        vmsvga3d_fill_rect(image, &rect, bytes, value);
+     }
+ 
+     return true;
+@@ -6469,6 +6492,8 @@ static bool vmsvga3d_clear_depth_stencil_image(
+     uint64_t stencil_mask;
+     uint64_t depth_value = 0;
+     uint64_t stencil_value = 0;
++    uint64_t keep;
++    uint64_t set;
+     SVGA3dRect full_rect;
+     uint32_t i;
+ 
+@@ -6540,20 +6565,37 @@ static bool vmsvga3d_clear_depth_stencil_image(
+             continue;
+         }
+ 
++        /* Every bit of the pixel is replaced: plain fill. */
++        if (((clear_depth ? depth_mask : 0) | (clear_stencil ? stencil_mask : 0)) ==
++            vmsvga3d_bit_mask(bytes * 8)) {
++            vmsvga3d_fill_rect(image, &rect, bytes,
++                               (uint32_t)(depth_value | stencil_value));
++            continue;
++        }
++
++        keep = ~((clear_depth ? depth_mask : 0) | (clear_stencil ? stencil_mask : 0));
++        set = (clear_depth ? depth_value : 0) | (clear_stencil ? stencil_value : 0);
+         for (y = 0; y < rect.h; y++) {
+             uint8_t *row = image->data + (uint64_t)(rect.y + y) * image->pitch +
+                            (uint64_t)rect.x * bytes;
++
++            if (bytes == 4) {
++                for (x = 0; x < rect.w; x++) {
++                    uint32_t value;
++
++                    memcpy(&value, row + (uint64_t)x * 4, 4);
++                    value = le32_to_cpu(value);
++                    value = (uint32_t)(((uint64_t)value & keep) | set);
++                    value = cpu_to_le32(value);
++                    memcpy(row + (uint64_t)x * 4, &value, 4);
++                }
++                continue;
++            }
+             for (x = 0; x < rect.w; x++) {
+                 uint8_t *pixel = row + (uint64_t)x * bytes;
+                 uint32_t value = vmsvga3d_load_le(pixel, bytes);
+ 
+-                if (clear_depth) {
+-                    value = (uint32_t)(((uint64_t)value & ~depth_mask) | depth_value);
+-                }
+-                if (clear_stencil) {
+-                    value = (uint32_t)(((uint64_t)value & ~stencil_mask) |
+-                                       stencil_value);
+-                }
++                value = (uint32_t)(((uint64_t)value & keep) | set);
+                 vmsvga3d_store_le(pixel, bytes, value);
+             }
+         }

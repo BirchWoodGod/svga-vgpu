@@ -1,0 +1,27 @@
+vmvga: compressed volume DMA used pixel rows for the guest slice pitch
+
+SVGAGuestImage.pitch is the distance between rows of blocks, so a slice
+of a block-compressed volume texture is ceil(height / block_height) block
+rows, not height rows. With the old value every slice after the first
+was looked for 4x too far into the guest buffer, past maximumOffset, so
+the whole upload of DXTn volume textures (Halo Online's 1024x1024x8
+DXT5 volumes) was rejected by the box check.
+
+diff --git a/hw/display/vmware_vga_3d.c b/hw/display/vmware_vga_3d.c
+index d079579..2335793 100644
+--- a/hw/display/vmware_vga_3d.c
++++ b/hw/display/vmware_vga_3d.c
+@@ -9847,7 +9847,12 @@ static bool vmsvga3d_surface_dma_box(struct vmsvga_state_s *s,
+         return false;
+     }
+ 
+-    guest_plane_pitch = (uint64_t)image->size.height * guest_pitch;
++    /* The guest pitch is the distance between rows of blocks, so one slice
++     * holds ceil(height / block_height) of them (1/4 of the pixel rows for
++     * DXTn/BCn volume textures). */
++    guest_plane_pitch =
++        (uint64_t)((image->size.height + block_height - 1) / block_height) *
++        guest_pitch;
+ 
+     for (z = 0; z < blocks_z; z++) {
+         for (y = 0; y < blocks_y; y++) {

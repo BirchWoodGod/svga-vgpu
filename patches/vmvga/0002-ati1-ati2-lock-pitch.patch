@@ -1,0 +1,61 @@
+vmvga: upload ATI1/ATI2 levels whose lock pitch is per pixel row
+
+D3D9 (and DXVK) report the lock pitch of ATI1/ATI2 surfaces as 8 bits per
+pixel (pitch = width), while vmvga's shadow uses rows of 4x4 blocks (4x
+larger). Every ATI2 upload was rejected (pitch 128 < row bytes 512), the
+texture evicted and every draw sampling it dropped; Halo Online uses ATI2
+normal maps everywhere. Copy such levels as one contiguous run (same bytes,
+same order), clamped to the locked size.
+
+diff --git a/hw/display/vmware_vga_dxvk.c b/hw/display/vmware_vga_dxvk.c
+index 45c9d54..1021cfc 100644
+--- a/hw/display/vmware_vga_dxvk.c
++++ b/hw/display/vmware_vga_dxvk.c
+@@ -12079,6 +12079,9 @@ bool vmsvga3d_dxvk_surface_upload_level(
+     bool success = false;
+     const uint32_t intz =
+         VMSVGA3D_D3D9_MAKE_FOURCC('I', 'N', 'T', 'Z');
++    const uint32_t ati1 = VMSVGA3D_D3D9_MAKE_FOURCC('A', 'T', 'I', '1');
++    const uint32_t ati2 = VMSVGA3D_D3D9_MAKE_FOURCC('A', 'T', 'I', '2');
++    bool ati_linear = false;
+     bool direct_lock_texture;
+ 
+     if (!vmsvga3d_dxvk_ready(dxvk) || surface == NULL ||
+@@ -12248,8 +12251,16 @@ bool vmsvga3d_dxvk_surface_upload_level(
+     }
+ 
+     result = lock_rect(source_surface, &locked, NULL, 0);
++    /* D3D9 reports the pitch of the vendor ATI1/ATI2 (BC4/BC5) formats as if
++     * they were 8 bpp (pitch = width, one row per texel row), while the guest
++     * shadow holds 4x4 block rows.  Both layouts are tightly packed in the
++     * same order, so such levels are copied as one contiguous run. */
++    ati_linear = vmsvga3d_dxvk_succeeded(result) && locked.bits != NULL &&
++                 locked.pitch > 0 && (uint32_t)locked.pitch < row_bytes &&
++                 (surface->d3d9_format == ati1 || surface->d3d9_format == ati2);
+     if (!vmsvga3d_dxvk_succeeded(result) || locked.bits == NULL ||
+-        locked.pitch < 0 || (uint32_t)locked.pitch < row_bytes) {
++        locked.pitch < 0 ||
++        ((uint32_t)locked.pitch < row_bytes && !ati_linear)) {
+         if (vmsvga3d_dxvk_succeeded(result)) {
+             unlock_rect(source_surface);
+         }
+@@ -12258,9 +12269,16 @@ bool vmsvga3d_dxvk_surface_upload_level(
+ 
+     destination = locked.bits;
+     source = data;
+-    for (y = 0; y < rows; y++) {
+-        memcpy(destination + (size_t)y * (uint32_t)locked.pitch,
+-               source + (size_t)y * row_bytes, row_bytes);
++    if (ati_linear) {
++        /* Locked buffer: pitch bytes per texel row, 4 texel rows per block row. */
++        uint64_t total = (uint64_t)row_bytes * rows;
++        uint64_t avail = (uint64_t)(uint32_t)locked.pitch * rows * 4;
++        memcpy(destination, source, (size_t)MIN(total, avail));
++    } else {
++        for (y = 0; y < rows; y++) {
++            memcpy(destination + (size_t)y * (uint32_t)locked.pitch,
++                   source + (size_t)y * row_bytes, row_bytes);
++        }
+     }
+ 
+     result = unlock_rect(source_surface);

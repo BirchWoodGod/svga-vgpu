@@ -1,0 +1,42 @@
+vmvga: translate SVGA3D_RS_OUTPUTGAMMA to D3DRS_SRGBWRITEENABLE
+
+The guest driver encodes D3DRS_SRGBWRITEENABLE as an output gamma (1.0
+linear, 2.2 sRGB), the same way SVGA3D_TS_GAMMA carries
+D3DSAMP_SRGBTEXTURE, which vmvga already translates. OUTPUTGAMMA was on
+the ignored list, so every sRGB-writing pass (tone mapping, composite)
+wrote linear values and the image came out crushed and far too dark.
+
+diff --git a/hw/display/vmware_vga_vgpu9.c b/hw/display/vmware_vga_vgpu9.c
+index 580e3f3..18676c4 100644
+--- a/hw/display/vmware_vga_vgpu9.c
++++ b/hw/display/vmware_vga_vgpu9.c
+@@ -162,6 +162,7 @@ enum {
+     D3D9_RS_COLORWRITEENABLE1 = 190,
+     D3D9_RS_COLORWRITEENABLE2 = 191,
+     D3D9_RS_COLORWRITEENABLE3 = 192,
++    D3D9_RS_SRGBWRITEENABLE = 194,
+     D3D9_RS_BLENDFACTOR = 193,
+     D3D9_RS_DEPTHBIAS = 195,
+     D3D9_RS_WRAP8 = 198,
+@@ -464,7 +465,6 @@ static bool vmsvga3d_d3d9_render_state_ignored(uint32_t state)
+     case SVGA3D_RS_FRONTWINDING:
+     case SVGA3D_RS_COORDINATETYPE:
+     case SVGA3D_RS_ZBIAS:
+-    case SVGA3D_RS_OUTPUTGAMMA:
+     case SVGA3D_RS_ZVISIBLE:
+     case SVGA3D_RS_TRANSPARENCYANTIALIAS:
+     case SVGA3D_RS_LINEWIDTH:
+@@ -1020,6 +1020,13 @@ vmsvga3d_d3d9_render_state(const SVGA3dRenderState *state,
+         plan->ops[0].state = D3D9_RS_DESTBLENDALPHA;
+         plan->ops[0].value = vmsvga3d_d3d9_blend(state->uintValue, D3D9_BLEND_ZERO);
+         break;
++    case SVGA3D_RS_OUTPUTGAMMA:
++        /* The guest driver sends D3DRS_SRGBWRITEENABLE as an output gamma:
++         * 1.0 for linear writes, 2.2 for sRGB.  Same convention as
++         * SVGA3D_TS_GAMMA for sampling. */
++        plan->ops[0].state = D3D9_RS_SRGBWRITEENABLE;
++        plan->ops[0].value = state->floatValue == 1.0f ? 0u : 1u;
++        break;
+     case SVGA3D_RS_ALPHAREF:
+         plan->ops[0].state = D3D9_RS_ALPHAREF;
+         plan->ops[0].value = (uint8_t)(state->floatValue * 255.0f);

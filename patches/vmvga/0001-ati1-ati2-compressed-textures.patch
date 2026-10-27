@@ -1,0 +1,48 @@
+vmvga: treat ATI1/ATI2 as block-compressed textures
+
+2D textures are created render-target-capable speculatively, with DXT1-5
+exempted as block-compressed formats, but ATI1/ATI2 (BC4/BC5) were not,
+and they were missing from the texture-hint list. Add them to both.
+Also log draws dropped because DXVK rejected a stream frequency.
+
+diff --git a/hw/display/vmware_vga_vgpu9.c b/hw/display/vmware_vga_vgpu9.c
+index a29dccf..c3827b8 100644
+--- a/hw/display/vmware_vga_vgpu9.c
++++ b/hw/display/vmware_vga_vgpu9.c
+@@ -586,6 +586,8 @@ SVGA3dSurface1Flags vmsvga3d_d3d9_normalize_surface_flags(
+     case SVGA3D_DXT3:
+     case SVGA3D_DXT4:
+     case SVGA3D_DXT5:
++    case SVGA3D_ATI1:
++    case SVGA3D_ATI2:
+     case SVGA3D_BUMPU8V8:
+     case SVGA3D_BUMPL6V5U5:
+     case SVGA3D_BUMPX8L8V8U8:
+@@ -760,13 +762,16 @@ static void vmsvga3d_d3d9_texture_plan(
+          * format supports it so a later target bind need not rematerialize the
+          * resource.  DXT textures cannot use that speculative path; keep only
+          * usage explicitly requested by the guest and avoid a guaranteed
+-         * CreateTexture failure before falling back to a usable texture. */
++         * CreateTexture failure before falling back to a usable texture.
++         * ATI1/ATI2 (BC4/BC5) are block-compressed too. */
+         switch (surface->format) {
+         case SVGA3D_DXT1:
+         case SVGA3D_DXT2:
+         case SVGA3D_DXT3:
+         case SVGA3D_DXT4:
+         case SVGA3D_DXT5:
++        case SVGA3D_ATI1:
++        case SVGA3D_ATI2:
+             primary_usage = plan->base_usage;
+             break;
+         default:
+@@ -4043,6 +4048,9 @@ VMSVGA3DD3D9AccelResult vmsvga3d_d3d9_runtime_draw_primitives(
+         }
+         if (!vmsvga3d_dxvk_set_stream_frequency(
+                 s->dxvk, i, streams[i].frequency)) {
++            fprintf(stderr,
++                    "VMVGA-D3D9-DRAW stream-frequency-rejected stream=%u "
++                    "frequency=0x%08x\n", i, streams[i].frequency);
+             failure_stage = "set-stream-frequency";
+             goto out;
+         }

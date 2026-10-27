@@ -1,0 +1,62 @@
+vmvga: put per-vertex streams before instance streams
+
+The SVGA protocol carries no D3D9 stream numbers, so vmvga numbers streams
+in declaration order. Halo Online declares its per-instance buffer first;
+D3D9 forbids instance data (D3DSTREAMSOURCE_INSTANCEDATA) on stream 0, so
+DXVK rejected SetStreamSourceFreq and vmvga dropped the draw: 30,000+ draws
+per match, all instanced level geometry. Move per-vertex streams to the
+front (keeping their order), renumber the elements and keep the
+declaration sorted by stream.
+
+--- a/hw/display/vmware_vga_vgpu9.c
++++ b/hw/display/vmware_vga_vgpu9.c
+@@ -1570,6 +1570,49 @@
+         stream_id++;
+     }
+ 
++    /* The SVGA protocol carries no D3D stream numbers, so streams are
++     * numbered in declaration order.  D3D9 forbids instance data
++     * (D3DSTREAMSOURCE_INSTANCEDATA) on stream 0; when the declaration lists
++     * an instanced buffer first, move the per-vertex streams to the front
++     * (keeping relative order) and renumber the elements to match. */
++    if (stream_id > 1 && stream_id <= SVGA3D_MAX_VERTEX_ARRAYS &&
++        (streams[0].frequency & 0x80000000u) != 0) {
++        VMSVGA3DD3D9VertexStream reordered[SVGA3D_MAX_VERTEX_ARRAYS];
++        uint32_t new_index[SVGA3D_MAX_VERTEX_ARRAYS];
++        uint32_t n = 0;
++        uint32_t i;
++
++        for (i = 0; i < stream_id; i++) {
++            if ((streams[i].frequency & 0x80000000u) == 0) {
++                new_index[i] = n;
++                reordered[n++] = streams[i];
++            }
++        }
++        if (n != 0) {
++            for (i = 0; i < stream_id; i++) {
++                if ((streams[i].frequency & 0x80000000u) != 0) {
++                    new_index[i] = n;
++                    reordered[n++] = streams[i];
++                }
++            }
++            memcpy(streams, reordered, sizeof(*streams) * stream_id);
++            for (i = 0; i < decl_count; i++) {
++                elements[i].stream = (uint16_t)new_index[elements[i].stream];
++            }
++            /* Keep the declaration sorted by stream (stable insertion sort). */
++            for (i = 1; i < decl_count; i++) {
++                VMSVGA3DD3D9VertexElement e = elements[i];
++                uint32_t j = i;
++
++                while (j > 0 && elements[j - 1].stream > e.stream) {
++                    elements[j] = elements[j - 1];
++                    j--;
++                }
++                elements[j] = e;
++            }
++        }
++    }
++
+     /* D3DDECL_END(): { 0xff, 0, D3DDECLTYPE_UNUSED(17), 0, 0, 0 }. */
+     elements[decl_count].stream = VMSVGA3D_D3D9_DECL_END_STREAM;
+     elements[decl_count].offset = 0;
